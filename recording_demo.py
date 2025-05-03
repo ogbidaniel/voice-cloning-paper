@@ -8,7 +8,7 @@ recording_demo.py – Gradio portal for COMP5300 voice‑cloning study
 • Tracks completed prompts and total recording duration in progress.json.
 • Resumes from the next incomplete prompt for a given Speaker-ID.
 
-Tested on **Gradio 4.15**, **Python 3.10**, macOS (Intel) – April 2025.
+Tested on **Gradio 4.15**, **Python 3.10**, macOS (Intel) – May 2025.
 Install deps:
     pip install gradio soundfile numpy boto3 silero-vad
 Run locally:
@@ -136,29 +136,30 @@ def record_and_save(speaker_id: str,
     except Exception as e:
         return gr.Warning(f"Audio processing error: {e}"), prompts[prompt_idx], prompt_idx, "", ""
 
-    try:
-        sr, recorded_audio = gr.Audio.get_waveform(audio) # Extract sample rate and audio data
-        audio_duration = len(recorded_audio) / sr
-    except Exception as e:
-        print(f"Error getting audio duration: {e}")
-        audio_duration = 0.0
-
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     fname = f"{speaker_id}_{prompt_idx:03d}_{timestamp}.wav"
 
+    local_file_path = Path(local_root) / "raw" / speaker_id / fname
+    s3_key = f"raw/{speaker_id}/{fname}" if bucket else None
+    path_str = f"s3://{bucket}/{s3_key}" if bucket else str(local_file_path)
+
     if bucket:
-        key = f"raw/{speaker_id}/{fname}"
-        upload_to_s3(wav_bytes, bucket, key)
-        path_str = f"s3://{bucket}/{key}"
+        upload_to_s3(wav_bytes, bucket, s3_key)
     else:
-        path = Path(local_root) / "raw" / speaker_id / fname
-        save_local(wav_bytes, path)
-        path_str = str(path)
+        save_local(wav_bytes, local_file_path)
 
     meta_path = Path(local_root) / "meta.csv"
     meta_path.parent.mkdir(parents=True, exist_ok=True)
     with meta_path.open("a", newline="", encoding="utf8") as f:
         csv.writer(f).writerow([speaker_id, prompt_idx, prompts[prompt_idx], path_str])
+
+    try:
+        # Load the saved audio file to get its duration
+        audio_info = sf.info(local_file_path)
+        audio_duration = audio_info.duration
+    except Exception as e:
+        print(f"Error getting audio info: {e}")
+        audio_duration = 0.0
 
     save_progress(progress_file, speaker_id, prompt_idx, audio_duration)
     progress_data = load_progress(progress_file)
