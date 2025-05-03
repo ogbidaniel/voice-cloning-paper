@@ -5,6 +5,8 @@ recording_demo.py – Gradio portal for COMP5300 voice‑cloning study
 • Volunteer enters Speaker‑ID, records, clicks **Submit & Next**.
 • WAV saved locally in  data/raw/<speaker>/  (add --bucket to push to S3 later).
 • Metadata appended to data/meta.csv  →  speaker_id,prompt_idx,prompt_text,path
+• Tracks completed prompts and total recording duration in progress.json.
+• Resumes from the next incomplete prompt for a given Speaker-ID.
 
 Tested on **Gradio 4.15**, **Python 3.10**, macOS (Intel) – April 2025.
 Install deps:
@@ -24,6 +26,7 @@ import io
 from pathlib import Path
 from typing import List, Tuple, Union
 
+import json
 import gradio as gr
 import numpy as np
 import soundfile as sf
@@ -69,6 +72,38 @@ def audio_to_wav_bytes(audio: AudioLike) -> bytes:
 
     raise ValueError("Unrecognized audio format from Gradio component")
 
+def load_progress(progress_file: Path) -> dict:
+    """Load progress data from JSON file."""
+    if progress_file.exists():
+        try:
+            with progress_file.open("r") as f:
+                return json.load(f)
+        except json.JSONDecodeError:
+            print("Error decoding progress.json. Starting with an empty progress.")
+            return {}
+    else:
+        return {}
+
+
+def save_progress(progress_file: Path, speaker_id: str, prompt_idx: int, audio_duration: float) -> None:
+    """Save progress to a JSON file."""
+    progress = load_progress(progress_file)
+
+    if speaker_id not in progress:
+        progress[speaker_id] = {
+            "completed_prompts": [],
+            "total_duration_seconds": 0.0,
+        }
+
+    # Update completed prompts and total duration
+    if prompt_idx not in progress[speaker_id]["completed_prompts"]:
+        progress[speaker_id]["completed_prompts"].append(prompt_idx)
+        progress[speaker_id]["total_duration_seconds"] += audio_duration
+        progress[speaker_id]["completed_prompts"] = sorted(list(set(progress[speaker_id]["completed_prompts"]))) # Ensure unique and sorted
+
+    with progress_file.open("w") as f:
+        json.dump(progress, f, indent=2)
+
 
 def upload_to_s3(data: bytes, bucket: str, key: str):
     if boto3 is None:
@@ -89,16 +124,24 @@ def record_and_save(speaker_id: str,
                     audio: AudioLike,
                     prompts: list[str],
                     bucket: str | None,
-                    local_root: str):
+                    local_root: str,
+                    progress_file: Path):
     if not speaker_id.strip():
-        return gr.Warning("Please enter Speaker‑ID first."), prompts[prompt_idx], prompt_idx
+        return gr.Warning("Please enter Speaker‑ID first."), prompts[prompt_idx], prompt_idx, "", ""
     if audio is None:
-        return gr.Warning("Please record before submitting."), prompts[prompt_idx], prompt_idx
+        return gr.Warning("Please record before submitting."), prompts[prompt_idx], prompt_idx, "", ""
 
     try:
         wav_bytes = audio_to_wav_bytes(audio)
     except Exception as e:
-        return gr.Warning(f"Audio processing error: {e}"), prompts[prompt_idx], prompt_idx
+        return gr.Warning(f"Audio processing error: {e}"), prompts[prompt_idx], prompt_idx, "", ""
+
+    try:
+        sr, recorded_audio = gr.Audio.get_waveform(audio) # Extract sample rate and audio data
+        audio_duration = len(recorded_audio) / sr
+    except Exception as e:
+        print(f"Error getting audio duration: {e}")
+        audio_duration = 0.0
 
     timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     fname = f"{speaker_id}_{prompt_idx:03d}_{timestamp}.wav"
@@ -117,28 +160,66 @@ def record_and_save(speaker_id: str,
     with meta_path.open("a", newline="", encoding="utf8") as f:
         csv.writer(f).writerow([speaker_id, prompt_idx, prompts[prompt_idx], path_str])
 
-    next_idx = (prompt_idx + 1) % len(prompts)
-    return f"✅ Saved to {path_str}", prompts[next_idx], next_idx
+    save_progress(progress_file, speaker_id, prompt_idx, audio_duration)
+    progress_data = load_progress(progress_file)
+    completed_count = len(progress_data.get(speaker_id, {}).get("completed_prompts", []))
+    total_duration = progress_data.get(speaker_id, {}).get("total_duration_seconds", 0.0)
+
+    # Determine the next prompt
+    completed_prompts = set(progress_data.get(speaker_id, {}).get("completed_prompts", []))
+    next_prompt_idx = -1
+    for i in range(len(prompts)):
+        if i not in completed_prompts:
+            next_prompt_idx = i
+            break
+    if next_prompt_idx == -1:
+        next_prompt_idx = 0 # Loop back to the beginning if all are done
+
+    return f"✅ Saved to {path_str}", prompts[next_prompt_idx], next_prompt_idx, f"Completed: {completed_count}/{len(prompts)}", f"Total Duration: {total_duration:.2f} seconds"
+
+def update_prompt_on_speaker_change(speaker_id: str, prompts: list[str], progress_file: Path) -> Tuple[str, int]:
+    """Load progress and determine the next prompt when the speaker ID changes."""
+    if not speaker_id.strip():
+        return prompts[0], 0
+    progress_data = load_progress(progress_file)
+    completed_prompts = set(progress_data.get(speaker_id, {}).get("completed_prompts", []))
+    next_prompt_idx = -1
+    for i in range(len(prompts)):
+        if i not in completed_prompts:
+            next_prompt_idx = i
+            break
+    if next_prompt_idx == -1:
+        next_prompt_idx = 0
+    return prompts[next_prompt_idx], next_prompt_idx
 
 # -----------------------------------------------------------------------------
 # UI builder
 # -----------------------------------------------------------------------------
 
 def build_ui(prompts: list[str], bucket: str | None, local_root: str):
-    with gr.Blocks(title="COMP5300 Voice‑Recording Portal") as demo:
-        gr.Markdown("""## Speaking Phase\n### Record sentences for the voice‑cloning study\n1. Put on headphones and find a quiet space.\n2. Click the microphone, read the sentence **exactly**, click stop.\n3. Hit **Submit & Next**. Repeat until done.\n""")
+    progress_file = Path("progress.json") # Define the progress file path here
 
-        speaker = gr.Text(label="Speaker‑ID (email or alias)")
-        prompt_box = gr.Textbox(value=prompts[0], interactive=False, label="Sentence to read")
+    with gr.Blocks(title="COMP5300 Voice‑Recording Portal") as demo:
+        gr.Markdown("""## Speaking Phase\n### Record sentences for the voice‑cloning study\n1. Put on headphones and find a quiet space.\n2. Click the microphone, read the sentence **exactly**, click stop.\n3. Hit **Submit & Next**. Repeat until done.""")
+        gr.Markdown("""**Note:** This is a research study. Your recordings will be used to train a voice model.\nPlease enter your `Speaker-ID` before recording. Use PV username (e.g. Jane Doe = `jdoe`).""")
+
+        speaker = gr.Text(label="Speaker‑ID")
+        prompt_box = gr.Textbox(label="Sentence to read")
         idx_state = gr.State(0)
+        progress_display = gr.Markdown(label="Progress")
+        duration_display = gr.Markdown(label="Total Duration")
 
         mic = gr.Audio(sources=["microphone"], format="wav", label="🎙️ Record here")
         status = gr.Markdown()
         btn = gr.Button("Submit & Next ➡️")
 
+        speaker.change(fn=update_prompt_on_speaker_change,
+                       inputs=[speaker, gr.State(prompts), gr.State(progress_file)],
+                       outputs=[prompt_box, idx_state])
+
         btn.click(record_and_save,
-                 inputs=[speaker, idx_state, mic, gr.State(prompts), gr.State(bucket), gr.State(local_root)],
-                 outputs=[status, prompt_box, idx_state])
+                 inputs=[speaker, idx_state, mic, gr.State(prompts), gr.State(bucket), gr.State(local_root), gr.State(progress_file)],
+                 outputs=[status, prompt_box, idx_state, progress_display, duration_display])
     return demo
 
 # -----------------------------------------------------------------------------

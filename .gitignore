@@ -1,1 +1,4 @@
-./data
+data
+progress.json
+data/meta.csv
+raw/
